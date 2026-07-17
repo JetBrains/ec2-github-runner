@@ -145098,6 +145098,123 @@ function buildMarketOptions() {
   };
 }
 
+async function createEc2InstanceWithFleetParams(imageId, subnetIds, securityGroupId, label, githubRegistrationToken, region) {
+  const ec2 = new EC2Client({ region });
+
+  // One override per subnet x instance type: more spot pools -> lower interruption probability
+  const overrides = subnetIds.flatMap((subnetId) =>
+    (config.input.ec2InstanceTypes || []).map((type) => ({
+      InstanceType: type,
+      SubnetId: subnetId,
+      // For Type='instant', allow AMI override so callers can pass ImageId without baking it into LT
+      ...(imageId ? { ImageId: imageId } : {})
+    }))
+  );
+
+  // Prepare to ensure we have a Launch Template ID (create one if not provided)
+  let launchTemplateId = config.input.launchTemplateId;
+  let createdTemporaryLt = false;
+
+  if (!launchTemplateId) {
+    core.info('No launch template ID provided. Creating a temporary Launch Template...');
+
+    const userData = buildUserDataScript(githubRegistrationToken, label);
+    core.info('Executing user data script: ' + userData.replace(githubRegistrationToken, '<redacted>'));
+
+    // Build LaunchTemplateData similar to RunInstances params
+    const ltData = {
+      SecurityGroupIds: [securityGroupId],
+      // Ephemeral runners must not survive an OS shutdown as stopped instances (on-demand default is 'stop')
+      InstanceInitiatedShutdownBehavior: 'terminate',
+      UserData: Buffer.from(userData).toString('base64'),
+      TagSpecifications: config.tagSpecifications
+    };
+
+    // Block device mappings (prefer explicit mappings if provided)
+    if (config.input.blockDeviceMappings && config.input.blockDeviceMappings.length > 0) {
+      ltData.BlockDeviceMappings = config.input.blockDeviceMappings;
+    } else if (config.input.ec2VolumeSize !== '' || config.input.ec2VolumeType !== '') {
+      ltData.BlockDeviceMappings = [
+        {
+          DeviceName: config.input.ec2DeviceName,
+          Ebs: {
+            ...(config.input.ec2VolumeSize !== '' && { VolumeSize: config.input.ec2VolumeSize }),
+            ...(config.input.ec2VolumeType !== '' && { VolumeType: config.input.ec2VolumeType })
+          }
+        }
+      ];
+    }
+
+    const ltName = `ec2-github-runner-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+
+    const createLtParams = {
+      LaunchTemplateName: ltName,
+      LaunchTemplateData: ltData
+    };
+
+    const createLtRes = await ec2.send(new CreateLaunchTemplateCommand(createLtParams));
+    launchTemplateId = createLtRes.LaunchTemplate.LaunchTemplateId;
+    createdTemporaryLt = true;
+    core.info(`Created temporary Launch Template ${launchTemplateId} with name ${ltName}`);
+  }
+
+  const isSpot = config.input.marketType === 'spot';
+
+  const fleetParams = {
+    Type: 'instant',
+    LaunchTemplateConfigs: [
+      {
+        LaunchTemplateSpecification: {
+          LaunchTemplateId: launchTemplateId,
+          Version: '$Latest'
+        },
+        Overrides: overrides
+      }
+    ],
+    TargetCapacitySpecification: {
+      TotalTargetCapacity: 1,
+      DefaultTargetCapacityType: isSpot ? 'spot' : 'on-demand',
+      SpotTargetCapacity: isSpot ? 1 : 0,
+      OnDemandTargetCapacity: isSpot ? 0 : 1
+    },
+    SpotOptions: isSpot ? { AllocationStrategy: 'price-capacity-optimized' } : undefined
+  };
+
+  let ec2InstanceId;
+  let ec2InstanceType;
+  const fleetRes = await ec2.send(new CreateFleetCommand(fleetParams));
+
+  // Try to extract instance ID from the response (Type='instant' should return Instances)
+  if (Array.isArray(fleetRes.Instances)) {
+    core.info(`EC2 Fleet returned ${fleetRes.Instances.length} instances`);
+    for (const group of fleetRes.Instances) {
+      if (Array.isArray(group.InstanceIds) && group.InstanceIds.length > 0) {
+        ec2InstanceId = group.InstanceIds[0];
+        ec2InstanceType = group.InstanceType;
+        break;
+      }
+    }
+  }
+
+  if (!ec2InstanceId) {
+    const errDetails = JSON.stringify({ Errors: fleetRes.Errors }, null, 2);
+    throw new Error(`EC2 Fleet did not return an instance ID. Details: ${errDetails}`);
+  }
+
+  core.info(`Successfully started AWS EC2 instance ${ec2InstanceId} with type ${ec2InstanceType} via EC2 Fleet in region ${region}`);
+
+  // clean up the temporary launch template if it was created
+  if (createdTemporaryLt && launchTemplateId) {
+    try {
+      await ec2.send(new DeleteLaunchTemplateCommand({ LaunchTemplateId: launchTemplateId }));
+      core.info(`Deleted temporary Launch Template ${launchTemplateId}`);
+    } catch (e) {
+      core.warning(`Failed to delete temporary Launch Template ${launchTemplateId}: ${e.message}`);
+    }
+  }
+  return ec2InstanceId;
+}
+
 async function createEc2InstanceWithParams(imageId, subnetIds, securityGroupId, label, githubRegistrationToken, region) {
   // If multiple instance types are provided, use EC2 Fleet (instant) to create an instance
   if (Array.isArray(config.input.ec2InstanceTypes) && config.input.ec2InstanceTypes.length > 0) {
@@ -145244,123 +145361,6 @@ async function waitForInstanceRunning(ec2InstanceId, region) {
     core.error(`AWS EC2 instance ${ec2InstanceId} initialization error`);
     throw error;
   }
-}
-
-async function createEc2InstanceWithFleetParams(imageId, subnetIds, securityGroupId, label, githubRegistrationToken, region) {
-  const ec2 = new EC2Client({ region });
-
-  // One override per subnet x instance type: more spot pools -> lower interruption probability
-  const overrides = subnetIds.flatMap((subnetId) =>
-    (config.input.ec2InstanceTypes || []).map((type) => ({
-      InstanceType: type,
-      SubnetId: subnetId,
-      // For Type='instant', allow AMI override so callers can pass ImageId without baking it into LT
-      ...(imageId ? { ImageId: imageId } : {})
-    }))
-  );
-
-  // Prepare to ensure we have a Launch Template ID (create one if not provided)
-  let launchTemplateId = config.input.launchTemplateId;
-  let createdTemporaryLt = false;
-
-  if (!launchTemplateId) {
-    core.info('No launch template ID provided. Creating a temporary Launch Template...');
-
-    const userData = buildUserDataScript(githubRegistrationToken, label);
-    core.info('Executing user data script: ' + userData.replace(githubRegistrationToken, '<redacted>'));
-
-    // Build LaunchTemplateData similar to RunInstances params
-    const ltData = {
-      SecurityGroupIds: [securityGroupId],
-      // Ephemeral runners must not survive an OS shutdown as stopped instances (on-demand default is 'stop')
-      InstanceInitiatedShutdownBehavior: 'terminate',
-      UserData: Buffer.from(userData).toString('base64'),
-      TagSpecifications: config.tagSpecifications
-    };
-
-    // Block device mappings (prefer explicit mappings if provided)
-    if (config.input.blockDeviceMappings && config.input.blockDeviceMappings.length > 0) {
-      ltData.BlockDeviceMappings = config.input.blockDeviceMappings;
-    } else if (config.input.ec2VolumeSize !== '' || config.input.ec2VolumeType !== '') {
-      ltData.BlockDeviceMappings = [
-        {
-          DeviceName: config.input.ec2DeviceName,
-          Ebs: {
-            ...(config.input.ec2VolumeSize !== '' && { VolumeSize: config.input.ec2VolumeSize }),
-            ...(config.input.ec2VolumeType !== '' && { VolumeType: config.input.ec2VolumeType })
-          }
-        }
-      ];
-    }
-
-    const ltName = `ec2-github-runner-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
-
-    const createLtParams = {
-      LaunchTemplateName: ltName,
-      LaunchTemplateData: ltData
-    };
-
-    const createLtRes = await ec2.send(new CreateLaunchTemplateCommand(createLtParams));
-    launchTemplateId = createLtRes.LaunchTemplate.LaunchTemplateId;
-    createdTemporaryLt = true;
-    core.info(`Created temporary Launch Template ${launchTemplateId} with name ${ltName}`);
-  }
-
-  const isSpot = config.input.marketType === 'spot';
-
-  const fleetParams = {
-    Type: 'instant',
-    LaunchTemplateConfigs: [
-      {
-        LaunchTemplateSpecification: {
-          LaunchTemplateId: launchTemplateId,
-          Version: '$Latest'
-        },
-        Overrides: overrides
-      }
-    ],
-    TargetCapacitySpecification: {
-      TotalTargetCapacity: 1,
-      DefaultTargetCapacityType: isSpot ? 'spot' : 'on-demand',
-      SpotTargetCapacity: isSpot ? 1 : 0,
-      OnDemandTargetCapacity: isSpot ? 0 : 1
-    },
-    SpotOptions: isSpot ? { AllocationStrategy: 'price-capacity-optimized' } : undefined
-  };
-
-  let ec2InstanceId;
-  let ec2InstanceType;
-  const fleetRes = await ec2.send(new CreateFleetCommand(fleetParams));
-
-  // Try to extract instance ID from the response (Type='instant' should return Instances)
-  if (Array.isArray(fleetRes.Instances)) {
-    core.info(`EC2 Fleet returned ${fleetRes.Instances.length} instances`);
-    for (const group of fleetRes.Instances) {
-      if (Array.isArray(group.InstanceIds) && group.InstanceIds.length > 0) {
-        ec2InstanceId = group.InstanceIds[0];
-        ec2InstanceType = group.InstanceType;
-        break;
-      }
-    }
-  }
-
-  if (!ec2InstanceId) {
-    const errDetails = JSON.stringify({ Errors: fleetRes.Errors }, null, 2);
-    throw new Error(`EC2 Fleet did not return an instance ID. Details: ${errDetails}`);
-  }
-
-  core.info(`Successfully started AWS EC2 instance ${ec2InstanceId} with type ${ec2InstanceType} via EC2 Fleet in region ${region}`);
-
-  // clean up the temporary launch template if it was created
-  if (createdTemporaryLt && launchTemplateId) {
-    try {
-      await ec2.send(new DeleteLaunchTemplateCommand({ LaunchTemplateId: launchTemplateId }));
-      core.info(`Deleted temporary Launch Template ${launchTemplateId}`);
-    } catch (e) {
-      core.warning(`Failed to delete temporary Launch Template ${launchTemplateId}: ${e.message}`);
-    }
-  }
-  return ec2InstanceId;
 }
 
 module.exports = {
