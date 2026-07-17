@@ -145098,153 +145098,18 @@ function buildMarketOptions() {
   };
 }
 
-async function createEc2InstanceWithParams(imageId, subnetId, securityGroupId, label, githubRegistrationToken, region) {
-  // If multiple instance types are provided, use EC2 Fleet (instant) to create an instance
-  if (Array.isArray(config.input.ec2InstanceTypes) && config.input.ec2InstanceTypes.length > 0) {
-    return await createEc2InstanceWithFleetParams(imageId, subnetId, securityGroupId, label, githubRegistrationToken, region);
-  }
-
-  // else, use RunInstances to create instance with fixed instance type
-  // Region is always specified now, so we can directly use it
-  const ec2ClientOptions = { region };
-  const ec2 = new EC2Client(ec2ClientOptions);
-
-  const userData = buildUserDataScript(githubRegistrationToken, label);
-  core.info('Executing user data script: ' + userData.replace(githubRegistrationToken, '<redacted>'));
-
-  const params = {
-    ImageId: imageId,
-    InstanceType: config.input.ec2InstanceType,
-    MaxCount: 1,
-    MinCount: 1,
-    SecurityGroupIds: [securityGroupId],
-    SubnetId: subnetId,
-    UserData: Buffer.from(userData).toString('base64'),
-    IamInstanceProfile: config.input.iamRoleName ? { Name: config.input.iamRoleName } : undefined,
-    TagSpecifications: config.tagSpecifications,
-    InstanceMarketOptions: buildMarketOptions(),
-    MetadataOptions: Object.keys(config.input.metadataOptions).length > 0 ? config.input.metadataOptions : undefined,
-  };
-
-  if (config.input.ec2VolumeSize !== '' || config.input.ec2VolumeType !== '') {
-    params.BlockDeviceMappings = [
-      {
-        DeviceName: config.input.ec2DeviceName,
-        Ebs: {
-          ...(config.input.ec2VolumeSize !== '' && { VolumeSize: config.input.ec2VolumeSize }),
-          ...(config.input.ec2VolumeType !== '' && { VolumeType: config.input.ec2VolumeType }),
-        },
-      },
-    ];
-  }
-
-  if (config.input.blockDeviceMappings.length > 0) {
-    params.BlockDeviceMappings = config.input.blockDeviceMappings;
-  }
-
-  const result = await ec2.send(new RunInstancesCommand(params));
-  const ec2InstanceId = result.Instances[0].InstanceId;
-  return ec2InstanceId;
-}
-
-async function startEc2Instance(label, githubRegistrationToken) {
-  core.info(`Attempting to start EC2 instance using ${config.availabilityZones.length} availability zone configuration(s)`);
-
-  const errors = [];
-
-  // Try each availability zone configuration in sequence
-  for (let i = 0; i < config.availabilityZones.length; i++) {
-    const azConfig = config.availabilityZones[i];
-    // Region is now always specified in the availability zone config
-    const region = azConfig.region;
-    core.info(`Trying availability zone configuration ${i + 1}/${config.availabilityZones.length}`);
-    core.info(`Using imageId: ${azConfig.imageId}, subnetId: ${azConfig.subnetId}, securityGroupId: ${azConfig.securityGroupId}, region: ${region}`);
-
-    try {
-      const ec2InstanceId = await createEc2InstanceWithParams(
-        azConfig.imageId,
-        azConfig.subnetId,
-        azConfig.securityGroupId,
-        label,
-        githubRegistrationToken,
-        region
-      );
-
-      core.info(`Successfully started AWS EC2 instance ${ec2InstanceId} using availability zone configuration ${i + 1} in region ${region}`);
-      return { ec2InstanceId, region };
-    } catch (error) {
-      const errorMessage = `Failed to start EC2 instance with configuration ${i + 1} in region ${region}: ${error.message}`;
-      core.warning(errorMessage);
-      errors.push(errorMessage);
-
-      // Continue to the next availability zone configuration
-      continue;
-    }
-  }
-
-  // If we've tried all configurations and none worked, throw an error
-  core.error('All availability zone configurations failed');
-  throw new Error(`Failed to start EC2 instance in any availability zone. Errors: ${errors.join('; ')}`);
-}
-
-async function terminateEc2Instance() {
-  const ec2 = new EC2Client();
-
-  const params = {
-    InstanceIds: [config.input.ec2InstanceId]
-  };
-
-  try {
-    await ec2.send(new TerminateInstancesCommand(params));
-    core.info(`AWS EC2 instance ${config.input.ec2InstanceId} is terminated`);
-    return;
-  } catch (error) {
-    core.error(`AWS EC2 instance ${config.input.ec2InstanceId} termination error`);
-    throw error;
-  }
-}
-
-async function waitForInstanceRunning(ec2InstanceId, region) {
-  // Region is always provided now
-  const ec2ClientOptions = { region };
-  const ec2 = new EC2Client(ec2ClientOptions);
-
-  core.info(`Using region ${region} for checking instance ${ec2InstanceId} status`);
-
-  try {
-    core.info(`Checking for instance ${ec2InstanceId} to be up and running`);
-    await waitUntilInstanceRunning(
-      {
-        client: ec2,
-        maxWaitTime: 300,
-      },
-      {
-        Filters: [
-          {
-            Name: 'instance-id',
-            Values: [ec2InstanceId],
-          },
-        ],
-      },
-    );
-
-    core.info(`AWS EC2 instance ${ec2InstanceId} is up and running`);
-    return;
-  } catch (error) {
-    core.error(`AWS EC2 instance ${ec2InstanceId} initialization error`);
-    throw error;
-  }
-}
-
-async function createEc2InstanceWithFleetParams(imageId, subnetId, securityGroupId, label, githubRegistrationToken, region) {
+async function createEc2InstanceWithFleetParams(imageId, subnetIds, securityGroupId, label, githubRegistrationToken, region) {
   const ec2 = new EC2Client({ region });
 
-  const overrides = (config.input.ec2InstanceTypes || []).map((type) => ({
-    InstanceType: type,
-    SubnetId: subnetId,
-    // For Type='instant', allow AMI override so callers can pass ImageId without baking it into LT
-    ...(imageId ? { ImageId: imageId } : {})
-  }));
+  // One override per subnet x instance type: more spot pools -> lower interruption probability
+  const overrides = subnetIds.flatMap((subnetId) =>
+    (config.input.ec2InstanceTypes || []).map((type) => ({
+      InstanceType: type,
+      SubnetId: subnetId,
+      // For Type='instant', allow AMI override so callers can pass ImageId without baking it into LT
+      ...(imageId ? { ImageId: imageId } : {})
+    }))
+  );
 
   // Prepare to ensure we have a Launch Template ID (create one if not provided)
   let launchTemplateId = config.input.launchTemplateId;
@@ -145259,6 +145124,8 @@ async function createEc2InstanceWithFleetParams(imageId, subnetId, securityGroup
     // Build LaunchTemplateData similar to RunInstances params
     const ltData = {
       SecurityGroupIds: [securityGroupId],
+      // Ephemeral runners must not survive an OS shutdown as stopped instances (on-demand default is 'stop')
+      InstanceInitiatedShutdownBehavior: 'terminate',
       UserData: Buffer.from(userData).toString('base64'),
       TagSpecifications: config.tagSpecifications
     };
@@ -145346,6 +145213,154 @@ async function createEc2InstanceWithFleetParams(imageId, subnetId, securityGroup
     }
   }
   return ec2InstanceId;
+}
+
+async function createEc2InstanceWithParams(imageId, subnetIds, securityGroupId, label, githubRegistrationToken, region) {
+  // If multiple instance types are provided, use EC2 Fleet (instant) to create an instance
+  if (Array.isArray(config.input.ec2InstanceTypes) && config.input.ec2InstanceTypes.length > 0) {
+    return await createEc2InstanceWithFleetParams(imageId, subnetIds, securityGroupId, label, githubRegistrationToken, region);
+  }
+
+  // else, use RunInstances to create instance with fixed instance type
+  // Region is always specified now, so we can directly use it
+  const ec2ClientOptions = { region };
+  const ec2 = new EC2Client(ec2ClientOptions);
+
+  const userData = buildUserDataScript(githubRegistrationToken, label);
+  core.info('Executing user data script: ' + userData.replace(githubRegistrationToken, '<redacted>'));
+
+  const params = {
+    ImageId: imageId,
+    InstanceType: config.input.ec2InstanceType,
+    MaxCount: 1,
+    MinCount: 1,
+    SecurityGroupIds: [securityGroupId],
+    // Ephemeral runners must not survive an OS shutdown as stopped instances (on-demand default is 'stop')
+    InstanceInitiatedShutdownBehavior: 'terminate',
+    UserData: Buffer.from(userData).toString('base64'),
+    IamInstanceProfile: config.input.iamRoleName ? { Name: config.input.iamRoleName } : undefined,
+    TagSpecifications: config.tagSpecifications,
+    InstanceMarketOptions: buildMarketOptions(),
+    MetadataOptions: Object.keys(config.input.metadataOptions).length > 0 ? config.input.metadataOptions : undefined,
+  };
+
+  if (config.input.ec2VolumeSize !== '' || config.input.ec2VolumeType !== '') {
+    params.BlockDeviceMappings = [
+      {
+        DeviceName: config.input.ec2DeviceName,
+        Ebs: {
+          ...(config.input.ec2VolumeSize !== '' && { VolumeSize: config.input.ec2VolumeSize }),
+          ...(config.input.ec2VolumeType !== '' && { VolumeType: config.input.ec2VolumeType }),
+        },
+      },
+    ];
+  }
+
+  if (config.input.blockDeviceMappings.length > 0) {
+    params.BlockDeviceMappings = config.input.blockDeviceMappings;
+  }
+
+  // RunInstances takes a single subnet, so try the provided subnets in sequence
+  let lastError;
+  for (const subnetId of subnetIds) {
+    try {
+      const result = await ec2.send(new RunInstancesCommand({ ...params, SubnetId: subnetId }));
+      return result.Instances[0].InstanceId;
+    } catch (error) {
+      core.warning(`RunInstances failed in subnet ${subnetId}: ${error.message}`);
+      lastError = error;
+    }
+  }
+  throw lastError;
+}
+
+async function startEc2Instance(label, githubRegistrationToken) {
+  core.info(`Attempting to start EC2 instance using ${config.availabilityZones.length} availability zone configuration(s)`);
+
+  const errors = [];
+
+  // Try each availability zone configuration in sequence
+  for (let i = 0; i < config.availabilityZones.length; i++) {
+    const azConfig = config.availabilityZones[i];
+    // Region is now always specified in the availability zone config
+    const region = azConfig.region;
+    core.info(`Trying availability zone configuration ${i + 1}/${config.availabilityZones.length}`);
+    core.info(`Using imageId: ${azConfig.imageId}, subnetIds: ${azConfig.subnetIds.join(',')}, securityGroupId: ${azConfig.securityGroupId}, region: ${region}`);
+
+    try {
+      const ec2InstanceId = await createEc2InstanceWithParams(
+        azConfig.imageId,
+        azConfig.subnetIds,
+        azConfig.securityGroupId,
+        label,
+        githubRegistrationToken,
+        region
+      );
+
+      core.info(`Successfully started AWS EC2 instance ${ec2InstanceId} using availability zone configuration ${i + 1} in region ${region}`);
+      return { ec2InstanceId, region };
+    } catch (error) {
+      const errorMessage = `Failed to start EC2 instance with configuration ${i + 1} in region ${region}: ${error.message}`;
+      core.warning(errorMessage);
+      errors.push(errorMessage);
+
+      // Continue to the next availability zone configuration
+      continue;
+    }
+  }
+
+  // If we've tried all configurations and none worked, throw an error
+  core.error('All availability zone configurations failed');
+  throw new Error(`Failed to start EC2 instance in any availability zone. Errors: ${errors.join('; ')}`);
+}
+
+async function terminateEc2Instance() {
+  const ec2 = new EC2Client();
+
+  const params = {
+    InstanceIds: [config.input.ec2InstanceId]
+  };
+
+  try {
+    await ec2.send(new TerminateInstancesCommand(params));
+    core.info(`AWS EC2 instance ${config.input.ec2InstanceId} is terminated`);
+    return;
+  } catch (error) {
+    core.error(`AWS EC2 instance ${config.input.ec2InstanceId} termination error`);
+    throw error;
+  }
+}
+
+async function waitForInstanceRunning(ec2InstanceId, region) {
+  // Region is always provided now
+  const ec2ClientOptions = { region };
+  const ec2 = new EC2Client(ec2ClientOptions);
+
+  core.info(`Using region ${region} for checking instance ${ec2InstanceId} status`);
+
+  try {
+    core.info(`Checking for instance ${ec2InstanceId} to be up and running`);
+    await waitUntilInstanceRunning(
+      {
+        client: ec2,
+        maxWaitTime: 300,
+      },
+      {
+        Filters: [
+          {
+            Name: 'instance-id',
+            Values: [ec2InstanceId],
+          },
+        ],
+      },
+    );
+
+    core.info(`AWS EC2 instance ${ec2InstanceId} is up and running`);
+    return;
+  } catch (error) {
+    core.error(`AWS EC2 instance ${ec2InstanceId} initialization error`);
+    throw error;
+  }
 }
 
 module.exports = {
@@ -145485,8 +145500,13 @@ class Config {
         core.info('Using individual parameters as a single availability zone configuration');
       }
 
-      if (this.marketType?.length > 0 && this.input.marketType !== 'spot') {
-        throw new Error('Invalid `market-type` input. Allowed values: spot.');
+      // Each config's subnetId may hold several comma/whitespace-separated subnets (multi-AZ spot pools)
+      this.availabilityZones.forEach((az) => {
+        az.subnetIds = String(az.subnetId).split(/[\s,]+/).filter(Boolean);
+      });
+
+      if (this.input.marketType && !['spot', 'on-demand'].includes(this.input.marketType)) {
+        throw new Error('Invalid `market-type` input. Allowed values: spot, on-demand.');
       }
     } else if (this.input.mode === 'stop') {
       if (!this.input.ec2InstanceId) {
