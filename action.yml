@@ -51,8 +51,11 @@ inputs:
     required: false
   subnet-id:
     description: >-
-      VPC Subnet Id. The subnet should belong to the same VPC as the specified security group.
+      One or more VPC Subnet Ids, separated by commas or whitespace. All subnets must belong to the same
+      VPC as the specified security group. Providing subnets in several availability zones widens the
+      pool choice for spot instances and lowers the interruption probability.
       This input is required if you use the 'start' mode and don't provide availability-zones-config.
+      The 'subnetId' field of availability-zones-config entries accepts the same multi-subnet format.
     required: false
   security-group-id:
     description: >-
@@ -97,6 +100,7 @@ inputs:
     description: >-
       Specifies the market (purchasing) option for the instance:
           - 'spot' - Use a spot instance
+          - 'on-demand' - Use an on-demand instance (same as leaving the input empty)
     required: false
   block-device-mappings:
     description: >-

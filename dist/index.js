@@ -145098,10 +145098,10 @@ function buildMarketOptions() {
   };
 }
 
-async function createEc2InstanceWithParams(imageId, subnetId, securityGroupId, label, githubRegistrationToken, region) {
+async function createEc2InstanceWithParams(imageId, subnetIds, securityGroupId, label, githubRegistrationToken, region) {
   // If multiple instance types are provided, use EC2 Fleet (instant) to create an instance
   if (Array.isArray(config.input.ec2InstanceTypes) && config.input.ec2InstanceTypes.length > 0) {
-    return await createEc2InstanceWithFleetParams(imageId, subnetId, securityGroupId, label, githubRegistrationToken, region);
+    return await createEc2InstanceWithFleetParams(imageId, subnetIds, securityGroupId, label, githubRegistrationToken, region);
   }
 
   // else, use RunInstances to create instance with fixed instance type
@@ -145118,7 +145118,8 @@ async function createEc2InstanceWithParams(imageId, subnetId, securityGroupId, l
     MaxCount: 1,
     MinCount: 1,
     SecurityGroupIds: [securityGroupId],
-    SubnetId: subnetId,
+    // Ephemeral runners must not survive an OS shutdown as stopped instances (on-demand default is 'stop')
+    InstanceInitiatedShutdownBehavior: 'terminate',
     UserData: Buffer.from(userData).toString('base64'),
     IamInstanceProfile: config.input.iamRoleName ? { Name: config.input.iamRoleName } : undefined,
     TagSpecifications: config.tagSpecifications,
@@ -145142,9 +145143,18 @@ async function createEc2InstanceWithParams(imageId, subnetId, securityGroupId, l
     params.BlockDeviceMappings = config.input.blockDeviceMappings;
   }
 
-  const result = await ec2.send(new RunInstancesCommand(params));
-  const ec2InstanceId = result.Instances[0].InstanceId;
-  return ec2InstanceId;
+  // RunInstances takes a single subnet, so try the provided subnets in sequence
+  let lastError;
+  for (const subnetId of subnetIds) {
+    try {
+      const result = await ec2.send(new RunInstancesCommand({ ...params, SubnetId: subnetId }));
+      return result.Instances[0].InstanceId;
+    } catch (error) {
+      core.warning(`RunInstances failed in subnet ${subnetId}: ${error.message}`);
+      lastError = error;
+    }
+  }
+  throw lastError;
 }
 
 async function startEc2Instance(label, githubRegistrationToken) {
@@ -145158,12 +145168,12 @@ async function startEc2Instance(label, githubRegistrationToken) {
     // Region is now always specified in the availability zone config
     const region = azConfig.region;
     core.info(`Trying availability zone configuration ${i + 1}/${config.availabilityZones.length}`);
-    core.info(`Using imageId: ${azConfig.imageId}, subnetId: ${azConfig.subnetId}, securityGroupId: ${azConfig.securityGroupId}, region: ${region}`);
+    core.info(`Using imageId: ${azConfig.imageId}, subnetIds: ${azConfig.subnetIds.join(',')}, securityGroupId: ${azConfig.securityGroupId}, region: ${region}`);
 
     try {
       const ec2InstanceId = await createEc2InstanceWithParams(
         azConfig.imageId,
-        azConfig.subnetId,
+        azConfig.subnetIds,
         azConfig.securityGroupId,
         label,
         githubRegistrationToken,
@@ -145236,15 +145246,18 @@ async function waitForInstanceRunning(ec2InstanceId, region) {
   }
 }
 
-async function createEc2InstanceWithFleetParams(imageId, subnetId, securityGroupId, label, githubRegistrationToken, region) {
+async function createEc2InstanceWithFleetParams(imageId, subnetIds, securityGroupId, label, githubRegistrationToken, region) {
   const ec2 = new EC2Client({ region });
 
-  const overrides = (config.input.ec2InstanceTypes || []).map((type) => ({
-    InstanceType: type,
-    SubnetId: subnetId,
-    // For Type='instant', allow AMI override so callers can pass ImageId without baking it into LT
-    ...(imageId ? { ImageId: imageId } : {})
-  }));
+  // One override per subnet x instance type: more spot pools -> lower interruption probability
+  const overrides = subnetIds.flatMap((subnetId) =>
+    (config.input.ec2InstanceTypes || []).map((type) => ({
+      InstanceType: type,
+      SubnetId: subnetId,
+      // For Type='instant', allow AMI override so callers can pass ImageId without baking it into LT
+      ...(imageId ? { ImageId: imageId } : {})
+    }))
+  );
 
   // Prepare to ensure we have a Launch Template ID (create one if not provided)
   let launchTemplateId = config.input.launchTemplateId;
@@ -145259,6 +145272,8 @@ async function createEc2InstanceWithFleetParams(imageId, subnetId, securityGroup
     // Build LaunchTemplateData similar to RunInstances params
     const ltData = {
       SecurityGroupIds: [securityGroupId],
+      // Ephemeral runners must not survive an OS shutdown as stopped instances (on-demand default is 'stop')
+      InstanceInitiatedShutdownBehavior: 'terminate',
       UserData: Buffer.from(userData).toString('base64'),
       TagSpecifications: config.tagSpecifications
     };
@@ -145485,8 +145500,13 @@ class Config {
         core.info('Using individual parameters as a single availability zone configuration');
       }
 
-      if (this.marketType?.length > 0 && this.input.marketType !== 'spot') {
-        throw new Error('Invalid `market-type` input. Allowed values: spot.');
+      // Each config's subnetId may hold several comma/whitespace-separated subnets (multi-AZ spot pools)
+      this.availabilityZones.forEach((az) => {
+        az.subnetIds = String(az.subnetId).split(/[\s,]+/).filter(Boolean);
+      });
+
+      if (this.input.marketType && !['spot', 'on-demand'].includes(this.input.marketType)) {
+        throw new Error('Invalid `market-type` input. Allowed values: spot, on-demand.');
       }
     } else if (this.input.mode === 'stop') {
       if (!this.input.ec2InstanceId) {

@@ -124,8 +124,13 @@ class Config {
         core.info('Using individual parameters as a single availability zone configuration');
       }
 
-      if (this.marketType?.length > 0 && this.input.marketType !== 'spot') {
-        throw new Error('Invalid `market-type` input. Allowed values: spot.');
+      // Each config's subnetId may hold several comma/whitespace-separated subnets (multi-AZ spot pools)
+      this.availabilityZones.forEach((az) => {
+        az.subnetIds = String(az.subnetId).split(/[\s,]+/).filter(Boolean);
+      });
+
+      if (this.input.marketType && !['spot', 'on-demand'].includes(this.input.marketType)) {
+        throw new Error('Invalid `market-type` input. Allowed values: spot, on-demand.');
       }
     } else if (this.input.mode === 'stop') {
       if (!this.input.ec2InstanceId) {
