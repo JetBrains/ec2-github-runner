@@ -25,8 +25,14 @@ async function start() {
 }
 
 async function stop() {
-  await aws.terminateEc2Instance();
-  await gh.removeRunner();
+  // Deregister before terminating: the instance is what unregisters an ephemeral
+  // runner, so killing it first strands the registration and makes GitHub report
+  // the runner as busy. Terminate regardless, so a removal failure never leaks EC2.
+  try {
+    await gh.removeRunner();
+  } finally {
+    await aws.terminateEc2Instance();
+  }
 }
 
 (async function () {

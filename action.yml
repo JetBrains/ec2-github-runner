@@ -107,6 +107,18 @@ inputs:
       JSON string specifying the block device mappings for the EC2 instance.
       Example: '[{"DeviceName": "/dev/sda1", "Ebs": {"VolumeSize": 100, "VolumeType": "gp3"}}]'
     required: false
+  shutdown-retry-interval-seconds:
+    description: >-
+      Specifies the retry interval in seconds while waiting for the runner to become
+      idle before removing it in the 'stop' mode.
+    required: false
+    default: '5'
+  shutdown-timeout-minutes:
+    description: >-
+      Specifies the timeout in minutes to wait for the runner to become idle before
+      removing it in the 'stop' mode.
+    required: false
+    default: '2'
   startup-quiet-period-seconds:
     description: >-
       Specifies the quiet period in seconds after the instance starts.
