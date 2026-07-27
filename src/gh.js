@@ -5,13 +5,20 @@ const config = require('./config');
 
 // use the unique label to find the runner
 // as we don't have the runner's id, it's not possible to get it in any other way
-async function getRunner(label) {
+async function listRunner(label) {
   const octokit = github.getOctokit(config.input.githubToken);
 
+  const runners = await octokit.paginate('GET /repos/{owner}/{repo}/actions/runners', config.githubContext);
+  const foundRunners = _.filter(runners, { labels: [{ name: label }] });
+  return foundRunners.length > 0 ? foundRunners[0] : null;
+}
+
+// waitForRunnerRegistered polls from a setInterval callback that has nowhere to
+// report a rejection, and an unreadable runner list is indistinguishable from a
+// runner that has not registered yet, so it keeps waiting either way.
+async function getRunner(label) {
   try {
-    const runners = await octokit.paginate('GET /repos/{owner}/{repo}/actions/runners', config.githubContext);
-    const foundRunners = _.filter(runners, { labels: [{ name: label }] });
-    return foundRunners.length > 0 ? foundRunners[0] : null;
+    return await listRunner(label);
   } catch (error) {
     return null;
   }
@@ -36,6 +43,10 @@ function positiveNumberInput(value, fallback) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function sleep(seconds) {
+  return new Promise((r) => setTimeout(r, seconds * 1000));
+}
+
 // GitHub keeps a runner flagged as busy for a few seconds after the job it ran
 // reports completion, and rejects DELETE with 400 while that flag is set. An
 // ephemeral runner also needs that window to unregister itself, which turns the
@@ -48,7 +59,20 @@ async function removeRunner() {
   const deadline = Date.now() + timeoutMinutes * 60 * 1000;
 
   for (;;) {
-    const runner = await getRunner(config.input.label);
+    let runner;
+    try {
+      // listRunner rather than getRunner: an unreadable runner list must not be
+      // mistaken for a runner that is gone, or the registration is dropped silently
+      runner = await listRunner(config.input.label);
+    } catch (error) {
+      if (Date.now() >= deadline) {
+        core.error('GitHub self-hosted runner removal error');
+        throw error;
+      }
+      core.info(`Could not read the list of GitHub self-hosted runners (${error.message}), retrying`);
+      await sleep(retryIntervalSeconds);
+      continue;
+    }
 
     // the runner is gone — either it unregistered itself or a previous attempt removed it
     if (!runner) {
@@ -78,7 +102,7 @@ async function removeRunner() {
       core.info(`GitHub self-hosted runner ${runner.name} is still running a job, waiting for it to become idle`);
     }
 
-    await new Promise((r) => setTimeout(r, retryIntervalSeconds * 1000));
+    await sleep(retryIntervalSeconds);
   }
 }
 

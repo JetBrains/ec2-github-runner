@@ -7,7 +7,7 @@ const SRC = path.join(__dirname, '..', 'src');
 // Inputs reach the action through INPUT_* variables, and both config and the
 // GitHub client are module singletons, so every case builds the world from
 // scratch and drops the modules from the require cache afterwards.
-function loadGh({ runnerStates, deleteResponses, timeoutMinutes = 1 }) {
+function setStopModeInputs(timeoutMinutes = 1) {
   process.env.GITHUB_REPOSITORY = 'JetBrains/jcp-air';
   process.env['INPUT_MODE'] = 'stop';
   process.env['INPUT_EC2-INSTANCE-ID'] = 'i-0test';
@@ -16,6 +16,10 @@ function loadGh({ runnerStates, deleteResponses, timeoutMinutes = 1 }) {
   process.env['INPUT_AWS-RESOURCE-TAGS'] = '[]';
   process.env['INPUT_SHUTDOWN-RETRY-INTERVAL-SECONDS'] = '0.01';
   process.env['INPUT_SHUTDOWN-TIMEOUT-MINUTES'] = String(timeoutMinutes);
+}
+
+function loadGh({ runnerStates, deleteResponses, timeoutMinutes = 1 }) {
+  setStopModeInputs(timeoutMinutes);
 
   const calls = { list: 0, delete: 0 };
   const github = require('@actions/github');
@@ -23,6 +27,7 @@ function loadGh({ runnerStates, deleteResponses, timeoutMinutes = 1 }) {
     paginate: async () => {
       const state = runnerStates[Math.min(calls.list, runnerStates.length - 1)];
       calls.list += 1;
+      if (state === 'error') throw new Error('502 Bad Gateway');
       return state === null ? [] : [{ id: 42, name: 'ip-10-129-94-167', busy: state, labels: [{ name: 't8og1' }] }];
     },
     request: async () => {
@@ -72,14 +77,25 @@ test('propagates a removal error that is not the busy race', async () => {
   assert.equal(calls.delete, 1);
 });
 
+test('keeps polling when the runner list cannot be read, then removes the runner', async () => {
+  const { gh, calls } = loadGh({ runnerStates: ['error', 'error', false], deleteResponses: ['ok'] });
+  await gh.removeRunner();
+  assert.equal(calls.list, 3);
+  assert.equal(calls.delete, 1);
+});
+
+test('surfaces a list failure instead of reporting the runner as already gone', async () => {
+  const { gh, calls } = loadGh({ runnerStates: ['error'], deleteResponses: ['ok'], timeoutMinutes: 0.002 });
+  await assert.rejects(gh.removeRunner(), /502 Bad Gateway/);
+  assert.equal(calls.delete, 0);
+});
+
 test('terminates the instance even when the runner could not be removed', async () => {
   const order = [];
   const gh = { removeRunner: async () => { order.push('remove'); throw new Error('boom'); } };
   const aws = { terminateEc2Instance: async () => order.push('terminate') };
 
-  process.env['INPUT_MODE'] = 'stop';
-  process.env['INPUT_EC2-INSTANCE-ID'] = 'i-0test';
-  process.env['INPUT_AWS-RESOURCE-TAGS'] = '[]';
+  setStopModeInputs();
   require.cache[require.resolve(path.join(SRC, 'gh.js'))] = { exports: gh };
   require.cache[require.resolve(path.join(SRC, 'aws.js'))] = { exports: aws };
   require(path.join(SRC, 'index.js'));
