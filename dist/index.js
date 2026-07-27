@@ -145326,6 +145326,11 @@ async function terminateEc2Instance() {
     core.info(`AWS EC2 instance ${config.input.ec2InstanceId} is terminated`);
     return;
   } catch (error) {
+    // the instance is already gone, which is the outcome this call asks for
+    if (error.name === 'InvalidInstanceID.NotFound') {
+      core.info(`AWS EC2 instance ${config.input.ec2InstanceId} no longer exists, so the termination is skipped`);
+      return;
+    }
     core.error(`AWS EC2 instance ${config.input.ec2InstanceId} termination error`);
     throw error;
   }
@@ -145393,6 +145398,8 @@ class Config {
       preRunnerScript: core.getInput('pre-runner-script'),
       runnerHomeDir: core.getInput('runner-home-dir'),
       securityGroupId: core.getInput('security-group-id'),
+      shutdownRetryIntervalSeconds: core.getInput('shutdown-retry-interval-seconds'),
+      shutdownTimeoutMinutes: core.getInput('shutdown-timeout-minutes'),
       startupQuietPeriodSeconds: core.getInput('startup-quiet-period-seconds'),
       startupRetryIntervalSeconds: core.getInput('startup-retry-interval-seconds'),
       startupTimeoutMinutes: core.getInput('startup-timeout-minutes'),
@@ -145571,23 +145578,54 @@ async function getRegistrationToken() {
   }
 }
 
+function positiveNumberInput(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+// GitHub keeps a runner flagged as busy for a few seconds after the job it ran
+// reports completion, and rejects DELETE with 400 while that flag is set. An
+// ephemeral runner also needs that window to unregister itself, which turns the
+// DELETE into a no-op. Poll until one of the two happens instead of giving the
+// runner a single chance to be ready.
 async function removeRunner() {
-  const runner = await getRunner(config.input.label);
   const octokit = github.getOctokit(config.input.githubToken);
+  const timeoutMinutes = positiveNumberInput(config.input.shutdownTimeoutMinutes, 2);
+  const retryIntervalSeconds = positiveNumberInput(config.input.shutdownRetryIntervalSeconds, 5);
+  const deadline = Date.now() + timeoutMinutes * 60 * 1000;
 
-  // skip the runner removal process if the runner is not found
-  if (!runner) {
-    core.info(`GitHub self-hosted runner with label ${config.input.label} is not found, so the removal is skipped`);
-    return;
-  }
+  for (;;) {
+    const runner = await getRunner(config.input.label);
 
-  try {
-    await octokit.request('DELETE /repos/{owner}/{repo}/actions/runners/{runner_id}', _.merge(config.githubContext, { runner_id: runner.id }));
-    core.info(`GitHub self-hosted runner ${runner.name} is removed`);
-    return;
-  } catch (error) {
-    core.error('GitHub self-hosted runner removal error');
-    throw error;
+    // the runner is gone — either it unregistered itself or a previous attempt removed it
+    if (!runner) {
+      core.info(`GitHub self-hosted runner with label ${config.input.label} is not found, so the removal is skipped`);
+      return;
+    }
+
+    if (!runner.busy) {
+      try {
+        await octokit.request('DELETE /repos/{owner}/{repo}/actions/runners/{runner_id}', _.merge(config.githubContext, { runner_id: runner.id }));
+        core.info(`GitHub self-hosted runner ${runner.name} is removed`);
+        return;
+      } catch (error) {
+        // 400 means the busy flag was still set when the request landed
+        if (error.status !== 400 || Date.now() >= deadline) {
+          core.error('GitHub self-hosted runner removal error');
+          throw error;
+        }
+        core.info(`GitHub self-hosted runner ${runner.name} reports it is still running a job, retrying`);
+      }
+    } else if (Date.now() >= deadline) {
+      core.error('GitHub self-hosted runner removal error');
+      throw new Error(
+        `GitHub self-hosted runner ${runner.name} was still running a job after ${timeoutMinutes} minutes, so it could not be removed.`,
+      );
+    } else {
+      core.info(`GitHub self-hosted runner ${runner.name} is still running a job, waiting for it to become idle`);
+    }
+
+    await new Promise((r) => setTimeout(r, retryIntervalSeconds * 1000));
   }
 }
 
@@ -147628,8 +147666,14 @@ async function start() {
 }
 
 async function stop() {
-  await aws.terminateEc2Instance();
-  await gh.removeRunner();
+  // Deregister before terminating: the instance is what unregisters an ephemeral
+  // runner, so killing it first strands the registration and makes GitHub report
+  // the runner as busy. Terminate regardless, so a removal failure never leaks EC2.
+  try {
+    await gh.removeRunner();
+  } finally {
+    await aws.terminateEc2Instance();
+  }
 }
 
 (async function () {

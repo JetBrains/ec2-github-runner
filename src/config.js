@@ -17,6 +17,8 @@ class Config {
       preRunnerScript: core.getInput('pre-runner-script'),
       runnerHomeDir: core.getInput('runner-home-dir'),
       securityGroupId: core.getInput('security-group-id'),
+      shutdownRetryIntervalSeconds: core.getInput('shutdown-retry-interval-seconds'),
+      shutdownTimeoutMinutes: core.getInput('shutdown-timeout-minutes'),
       startupQuietPeriodSeconds: core.getInput('startup-quiet-period-seconds'),
       startupRetryIntervalSeconds: core.getInput('startup-retry-interval-seconds'),
       startupTimeoutMinutes: core.getInput('startup-timeout-minutes'),

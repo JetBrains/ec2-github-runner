@@ -318,6 +318,11 @@ async function terminateEc2Instance() {
     core.info(`AWS EC2 instance ${config.input.ec2InstanceId} is terminated`);
     return;
   } catch (error) {
+    // the instance is already gone, which is the outcome this call asks for
+    if (error.name === 'InvalidInstanceID.NotFound') {
+      core.info(`AWS EC2 instance ${config.input.ec2InstanceId} no longer exists, so the termination is skipped`);
+      return;
+    }
     core.error(`AWS EC2 instance ${config.input.ec2InstanceId} termination error`);
     throw error;
   }
