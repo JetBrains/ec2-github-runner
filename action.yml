@@ -147,6 +147,13 @@ inputs:
     description: >-
       JSON string specifying the metadata options for the EC2 instance.
       Example: '{"HttpTokens": "required", "HttpEndpoint": "enabled", "HttpPutResponseHopLimit": 2, "InstanceMetadataTags": "enabled"}'
+    required: false
+  cpu-options:
+    description: >-
+      JSON string specifying the CPU options for the EC2 instance, applied to both RunInstances and the
+      EC2 Fleet launch template. Example: '{"NestedVirtualization": "enabled"}' (8th generation Intel
+      instance types only: c8i, m8i, r8i and their flex variants).
+    required: false
   packages:
     description: >-
       JSON array of packages to install via cloud-init.

@@ -29,6 +29,7 @@ class Config {
       blockDeviceMappings: JSON.parse(core.getInput('block-device-mappings') || '[]'),
       availabilityZonesConfig: core.getInput('availability-zones-config'),
       metadataOptions: JSON.parse(core.getInput('metadata-options') || '{}'),
+      cpuOptions: JSON.parse(core.getInput('cpu-options') || '{}'),
       packages: JSON.parse(core.getInput('packages') || '[]'),
       disableEphemeralRunner: core.getInput('disable-ephemeral-runner') === 'true',
     };
