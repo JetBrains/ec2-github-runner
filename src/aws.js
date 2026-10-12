@@ -119,7 +119,8 @@ async function createEc2InstanceWithFleetParams(imageId, subnetIds, securityGrou
       // Ephemeral runners must not survive an OS shutdown as stopped instances (on-demand default is 'stop')
       InstanceInitiatedShutdownBehavior: 'terminate',
       UserData: Buffer.from(userData).toString('base64'),
-      TagSpecifications: config.tagSpecifications
+      TagSpecifications: config.tagSpecifications,
+      CpuOptions: Object.keys(config.input.cpuOptions).length > 0 ? config.input.cpuOptions : undefined
     };
 
     // Block device mappings (prefer explicit mappings if provided)
@@ -234,6 +235,7 @@ async function createEc2InstanceWithParams(imageId, subnetIds, securityGroupId, 
     TagSpecifications: config.tagSpecifications,
     InstanceMarketOptions: buildMarketOptions(),
     MetadataOptions: Object.keys(config.input.metadataOptions).length > 0 ? config.input.metadataOptions : undefined,
+    CpuOptions: Object.keys(config.input.cpuOptions).length > 0 ? config.input.cpuOptions : undefined,
   };
 
   if (config.input.ec2VolumeSize !== '' || config.input.ec2VolumeType !== '') {
